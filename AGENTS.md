@@ -122,27 +122,6 @@ Both scripts iterate `particles-571.csv` in row order and apply the same alive-p
 
 Two Impact samples (`csv_row_idx` 4771, 1637 in the 5k test set) have single-point spikes in `sigma_x/y` at `z ≈ 1 μm`, right at the cathode. These are simulation artifacts on the order of 1 μm wide — finer than any practical s-grid can resolve. Filtering to `z ≥ 1 mm` skips them. The surrogate's training s-range starts at 1 mm anyway.
 
-## Directory Structure
-
-```
-modeling-twissparameters/
-├── extract_twiss_from_impact.py      # Step 1: Impact-T extraction (emittance, sigma)
-├── extract_twiss_from_tao.py         # Step 2: Tao extraction (Twiss)
-├── plot_emittance_resolution_study.py # Step 3: choose ds for training s-grid
-│
-├── twiss-impact-output-5000/         # Small Impact test extraction (5k samples)
-│   ├── twiss_vs_position.csv
-│   └── endpoint_summary.csv
-│
-├── twiss-impact-output/              # Full Impact extraction (~55k after alive filter)
-├── twiss-tao-output/                 # Full Tao extraction (~55k × 1,803 elements)
-│
-├── resolution-study/                 # ds study, single sample
-├── resolution-study-20/              # ds study, 20 samples
-├── resolution-study-100/             # ds study, 100 samples (with cathode artifacts)
-└── resolution-study-100-clean/       # ds study, 100 samples (z ≥ 1 mm) — final result
-```
-
 ## Dataset Sizes (after alive filter `n_particles_571 ≥ 90000`)
 
 | Source CSV | Total rows | With archive / settings | After alive filter |
