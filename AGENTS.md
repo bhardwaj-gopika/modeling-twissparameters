@@ -21,7 +21,8 @@ Architecture: `(19 control params, s) → MLP → (target values at that s)` ("a
 - **Single data source**: Impact-T provides particle-tracking statistics (true beam moments). Twiss parameters are computed *from* those moments using Courant–Snyder definitions (see below). We previously experimented with extracting design Twiss from Tao, but that approach was dropped: the surrogate should predict the actual beam Twiss (which is what Impact gives via its second moments), not the design lattice Twiss.
 - **Alive-particle filter**: Samples with fewer than 90,000 surviving particles at screen 571 (`n_particles_571 < 90000`) are removed before any analysis. This matches the cut used by the `modeling-571` model and removes ~14% of samples (~9k of ~63k), which would otherwise produce extreme outliers in beam statistics.
 - **s-spacing**: A resolution study chose **ds = 0.02 m** (2 cm) as the training-grid spacing. Worst-case peak error <1.3% across 100 random samples, well under the 5% threshold supervisor specified.
-- **Note on `s` vs `z`**: For the FACET-II injector (no bends until well past z = 4.2 m), `s` (arc length along the design orbit) and `z` (longitudinal Cartesian) are interchangeable. Impact reports `mean_z`; we treat that as `s` in the dataset.
+- **Note on `s` vs `z`**: For the FACET-II injector (no bends through the L0 linac region), `s` (arc length along the design orbit) and `z` (longitudinal Cartesian) are interchangeable. Impact reports `mean_z`; we treat that as `s` in the dataset.
+- **s-range covered**: Impact-T tracking in this dataset runs from the cathode (z ≈ 0) to L0AFEND at **s = 4.127448 m**. Although PR10571 sits at s = 14.232788 m in the Bmad lattice, it is *not* reached by the Impact run — beam state at PR10571 is taken from precomputed columns in `particles-571.csv` (downstream Bmad outputs). The surrogate's grid therefore covers gun → L0AFEND (~4.13 m).
 
 ## Twiss Parameter Definitions
 
@@ -165,21 +166,191 @@ Outputs:
 
 **Result locked in**: ds = 0.02 m (~210 s-points per sample over the injector region z = 0.001 to ~4.2 m). Justified by worst-case <1.3% peak error across 100 samples.
 
-### 4. Build training dataset (planned, not yet implemented)
+### 4. Build training dataset (`build_training_dataset.py`)
 
-`build_training_dataset.py` will:
-- Build a common s-grid from `z = 0.001` m to `z = 4.2` m at `ds = 0.02` m
-- Interpolate each sample's targets from the Twiss-augmented CSV onto that grid
-- Join with the 19 machine control parameters from `particles-571.csv`
-- Output long-format CSV: `[sample_idx, csv_row_idx, 19 inputs, s, sigma_x/y/z, norm_emit_x/y, emit_geom_x/y, beta_x/y, alpha_x/y, mean_kinetic_energy]`
+Reads the Twiss-augmented CSV and `particles-571.csv`, applies all filters, interpolates targets onto the uniform s-grid, and writes a long-format dataset:
 
-### 5. Train/val/test split (planned)
+```bash
+python build_training_dataset.py \
+    --twiss twiss-impact-output/twiss_vs_position_with_twiss.csv \
+    --particles particles-571.csv \
+    --output dataset.csv
+```
 
-Adapt the `split_dataset.py` pattern from `modeling-571-moredata` — 70/15/15 split **by `sample_idx`** (not by row) so all s-points of one simulation stay together. Otherwise the model leaks information between train and val sets.
+Defaults: `--s-min 0.001`, `--s-max 4.13`, `--ds 0.02` (≈ 207 grid points), `--min-alive-particles 90000`.
 
-### 6. Training (planned)
+Filters applied (per sample) in order:
 
-Adapt `train.py` from `modeling-571-moredata`. Simpler than the covariance model — no Cholesky tricks. Plain MLP: 20 inputs → ~12 outputs.
+1. **Alive-particle filter** — `n_particles_571 >= 90000` (default; configurable via `--min-alive-particles`, 0 disables). Source: `particles-571.csv`. Pass rate on the working population: 54,987 / 64,570 ≈ 85%.
+
+2. **Input-feature range filter** (`INPUT_RANGES` in script). 17 of the 19 control parameters are bounded; `distgen:VCC` and `impact_VCC_Cal` are kept as model inputs but **not** bounded. Disable with `--no-input-filter`.
+
+   | Control parameter | Lower | Upper |
+   |---|---|---|
+   | `GUNF:theta0_deg` | −81 | −68 |
+   | `GUNF:rf_field_scale` | 4.9 × 10⁷ | 5.2 × 10⁷ |
+   | `SOL10111:solenoid_field_scale` | 0.25 | 0.29 |
+   | `CQ10121:b1_gradient` | −0.05 | 0.00 |
+   | `SQ10122:b1_gradient` | −0.05 | 0.02 |
+   | `distgen:t_dist:sigma_t:value` | −0.25 | 2.0 |
+   | `distgen:total_charge:value` | 900 | 1050 |
+   | `L0AF_phase:theta0_deg` | −10 | 0 |
+   | `L0AF_scale:rf_field_scale` | 5.0 × 10⁷ | 5.3 × 10⁷ |
+   | `L0BF_phase:theta0_deg` | −10 | 20 |
+   | `L0BF_scale:rf_field_scale` | 5.4 × 10⁷ | 6.5 × 10⁷ |
+   | `QA10361` | 3.0 | 4.0 |
+   | `QA10371` | −4.2 | −3.2 |
+   | `QE10425` | 3 | 9 |
+   | `QE10441` | −8 | −5 |
+   | `QE10511` | 2 | 4 |
+   | `QE10525` | −7 | 1 |
+
+   Combined input-filter pass rate on alive samples: **56.1%** (30,867 / 54,987 on the SDF run). Rejects 24,120 samples.
+
+3. **Target-state filters at three screens** (`TARGET_RANGES` in script). Disable with `--no-target-filter`.
+
+   | Screen | s (m) | Source | sigma_x | sigma_y | mean_pz | mean_t |
+   |---|---|---|---|---|---|---|
+   | **PR10241** | 0.942084 | Interpolated from Impact CSV | ≤ 2 mm | ≤ 2 mm | [6.0, 6.3] MeV/c | [3.17, 3.20] ns |
+   | **L0AFEND** | 4.127448 | Interpolated from Impact CSV | ≤ 2 mm | ≤ 2 mm | [98.35, 111.87] MeV/c | [13.80, 13.90] ns |
+   | **PR10571** | 14.232788 (lattice) | `particles-571.csv` columns | ≤ 2 mm | ≤ 2 mm | [155, 175] MeV/c | *dropped* |
+
+   Notes:
+   - `mean_pz` is computed from `mean_kinetic_energy` via `pz = sqrt((KE + m_e c²)² − (m_e c²)²)`.
+   - PR10571 is not reached by Impact, so its `sigma_x`, `sigma_y`, and `mean_kinetic_energy` come from precomputed columns in `particles-571.csv`. `mean_t` at PR10571 is not stored anywhere and the filter is intentionally dropped.
+   - SDF-run rejection counts on the 30,867 input-survivors: PR10241 → 5, L0AFEND → 54, PR10571 → 18,912. The 571 cut dominates (~61% of input-survivors); 241 and L0AFEND together remove <0.2%.
+
+**Actual SDF-run yield**: **11,896 samples kept** out of 54,987 alive (**21.6% overall pass rate**), producing **2,450,576 rows** in `dataset.csv` (~206 s-grid points per sample). Full rejection breakdown: `{alive: 0, input: 24120, tgt_241: 5, tgt_L0AFEND: 54, tgt_571: 18912}`.
+
+**Output columns** (34 total): `[sample_idx, csv_row_idx, 19 inputs, s, sigma_x, sigma_y, sigma_z, norm_emit_x, norm_emit_y, emit_geom_x, emit_geom_y, beta_x, alpha_x, beta_y, alpha_y, mean_kinetic_energy]`. One row per (sample × s-grid-point).
+
+**`sample_idx` vs `csv_row_idx`**: `sample_idx` is a sequential counter 0..N over the *kept* samples (useful for stratified splitting). `csv_row_idx` is the original row index in `particles-571.csv` (canonical identifier; preserved for traceability).
+
+**Progress lines** look like:
+```
+N kept, M rows | skipped: {'alive': a, 'input': i, 'tgt_241': t1, 'tgt_L0AFEND': t2, 'tgt_571': t5, 'other': o}
+```
+where `kept` is samples written, `M = kept × ~207` s-grid points, and `skipped` are cumulative rejection counts per filter stage.
+
+### 5. Train/val/test split (`split_dataset.py`)
+
+Splits `dataset.csv` 70/15/15 **by `sample_idx`** (not by row) so that all ~206 s-grid rows of one simulation end up in the same split. Splitting by row would put adjacent s-points of the same sample on both sides of the train/val boundary and dramatically overstate generalization.
+
+```bash
+python split_dataset.py dataset.csv \
+    --train-fraction 0.70 --val-fraction 0.15 --test-fraction 0.15 \
+    --seed 42
+```
+
+Two-pass streaming for constant memory:
+1. **Pass 1**: read only the `sample_idx` column to collect unique IDs (~12k ints).
+2. **Pass 2**: read 500k-row chunks; for each row, look up its `sample_idx` in train/val/test ID sets and `to_csv(..., mode="a")` into the matching output file.
+
+Outputs (next to the input by default): `dataset-train.csv`, `dataset-val.csv`, `dataset-test.csv`.
+
+Production split (seed=42): **8,327 / 1,784 / 1,785 samples** → ~1.72 M / 367 k / 368 k rows.
+
+CLI flags: `--seed`, `--output-dir`, `--prefix`, `--chunksize`, `--id-column` (default `sample_idx`).
+
+### 6. Training (`train.py`)
+
+Plain regression MLP. 20 inputs (19 control parameters + `s`) → 12 targets. No Cholesky machinery, no covariance loss — just z-score-normalized L1 regression.
+
+**Architecture** (matches the `modeling-571-moredata` covariance surrogate backbone):
+
+```
+Linear(20  → 100), ELU
+Linear(100 → 200), ELU, Dropout(0.05)
+Linear(200 → 200), ELU, Dropout(0.05)
+Linear(200 → 300), ELU, Dropout(0.05)
+Linear(300 → 300), ELU, Dropout(0.05)
+Linear(300 → 200), ELU, Dropout(0.05)
+Linear(200 → 100), ELU, Dropout(0.05)
+Linear(100 → 100), ELU
+Linear(100 → 100), ELU
+Linear(100 →  12)               # output head
+```
+
+~316k parameters. The model stores `y_mean`/`y_std` as buffers; `forward()` returns predictions in normalized (z-score) space, and `predict_raw()` is provided for inference in raw units.
+
+**Normalization**: input and output statistics are computed from the **training split only** and saved to `input_transformers.pt` / `output_transformers.pt` for use by `analyze.py` and downstream inference.
+
+**Training recipe**:
+
+| Phase | What happens |
+|---|---|
+| Base | Up to `--epochs` (default 200) at `--batch-size 256` / `--lr 1e-3`. Adam + `ReduceLROnPlateau(factor=0.5, patience=10)`. Early stop after `--patience` epochs without val improvement (default 40, recommend 15). |
+| Finetune stage *k* | Reload best checkpoint. Re-train at progressively smaller batch sizes (`--finetune-batch-sizes 32 8 …`) with `--finetune-lr 1e-4` decayed by `--finetune-lr-decay 0.5` per stage. Each stage uses `ReduceLROnPlateau(patience=5, min_lr=1e-6)`. |
+
+```bash
+python train.py \
+    --loss l1 --epochs 200 --patience 40 \
+    --batch-size 256 --lr 1e-3 \
+    --finetune-batch-sizes 32 8 --finetune-epochs-per-stage 100 \
+    --finetune-lr 1e-4 --finetune-lr-decay 0.5 \
+    --output-dir model-output
+```
+
+On SDF: `sbatch gpu_train.sh` (A100, 80 GB, 10 h walltime).
+
+**Outputs** in `--output-dir`:
+- `model.pt` — best-val checkpoint (overwritten whenever val_loss improves across any phase)
+- `input_transformers.pt` — `{x_mean, x_std, feature_cols}`
+- `output_transformers.pt` — `{y_mean, y_std, target_cols}`
+- `training_history.csv` — `phase, epoch, train_loss, val_loss, lr` per epoch (across all phases)
+- `test_metrics.csv` — per-target `mae` and `mape_percent` evaluated on the test set at the end of training
+
+**Practical lessons from the production run**:
+
+- The **base run** alone converges to val_loss ≈ 0.10 within ~25 epochs and then starts overfitting; if you only care about the base model, set `--patience 15`.
+- **Fine-tune stages 1 (bs=32) and 2 (bs=8) do all the real work**: val_loss drops from ~0.10 to ~0.053. This translates to **30–70% reduction in test MAPE** across every target and eliminates the cathode-region "stripes" in scatter plots.
+- A **bs=2 third stage is wasteful for this dataset size** (~1.7 M rows): each epoch is ~860k optimizer steps and takes ~35 min on an A100. In our run, stage 3 val_loss bottomed at epoch 1 (0.0535), the plateau scheduler collapsed LR from 2.5e-5 to 3.13e-6 within 19 epochs, and the remaining 281 epochs would have run for ~163 hours of compute with no improvement. **Don't include bs=2** unless you have a much smaller dataset where each "epoch" is cheap.
+- L1 loss in normalized target space behaves better than MSE here because several targets (emittances, sigma_z) have small dynamic range and L1 keeps gradients well-scaled across all 12 outputs.
+
+### 7. Analysis (`analyze.py`)
+
+Loads the trained model + transformers from `--model-dir`, runs the test CSV through it, and produces a metrics file plus 8 figures.
+
+```bash
+python analyze.py \
+    --model-dir model-output \
+    --test-csv dataset-test.csv \
+    --output-dir analysis
+```
+
+| Output | Description |
+|---|---|
+| `test_metrics.csv` | Per-target MAE, RMSE, MAPE (robust: ignores rows where \|true\| < 1% of column std) |
+| `training_curve.png` | Train/val loss vs cumulative epoch, log-y, color-coded by phase from `training_history.csv` |
+| `mae_per_target.png` | Bar chart of MAE per target (raw units, log y) |
+| `mape_per_target.png` | Bar chart of MAPE % per target with overall-mean dashed line |
+| `scatter_pred_vs_true.png` | 12-panel scatter, per-panel R² computed on the 1–99 percentile inlier window |
+| `per_sample_overlay.png` | True vs predicted line plot for the first ~1500 test rows (sample order) |
+| `per_sample_zoomed.png` | Same as above but with 5–95 percentile y-zoom, dot version |
+| `sorted_by_magnitude.png` | Rows sorted by \|true\|: useful for spotting systematic bias across the range |
+| `evolution_curves.png` | 5 random test samples plotted as `target vs s`; true solid, predicted dashed, one color per sample |
+
+Diagnostic flags: `--skip-scatter`, `--skip-overlay`, `--skip-sorted`, `--skip-evolution`, `--overlay-max-samples N`, `--evolution-num-samples N`.
+
+**Production headline (fine-tuned model, 1,785 test samples)**:
+
+| Target | MAE | MAPE | R² |
+|---|---:|---:|---:|
+| `sigma_x` | 9.23e-6 m | 1.44% | 0.999 |
+| `sigma_y` | 8.87e-6 m | 1.47% | 0.999 |
+| `sigma_z` | 5.98e-6 m | 0.96% | 0.868 |
+| `norm_emit_x` | 2.63e-7 m·rad | 3.20% | 1.000 |
+| `norm_emit_y` | 2.38e-7 m·rad | 3.33% | 1.000 |
+| `emit_geom_x` | 1.45e-8 m·rad | 3.34% | 1.000 |
+| `emit_geom_y` | 1.42e-8 m·rad | 3.29% | 1.000 |
+| `beta_x` | 0.237 m | 3.20% | 0.998 |
+| `beta_y` | 0.201 m | 3.69% | 0.998 |
+| `alpha_x` | 0.452 | 21.2% | 0.968 |
+| `alpha_y` | 0.411 | 23.4% | 0.969 |
+| `mean_kinetic_energy` | 4.25e5 eV | 1.19% | 1.000 |
+
+- `alpha_x/y` MAPE is inflated because alpha crosses zero (range ≈ [−10, +13]); R² is the honest signal.
+- `sigma_z` R² = 0.868 looks low but MAPE = 0.96% is the lowest in the table — its dynamic range across the beamline is very narrow (~5.7e−4 to ~6.8e−4 m), so tiny absolute errors eat most of the variance. Practically fine.
 
 ## Key Operational Details
 
@@ -208,9 +379,17 @@ The extraction script writes each successful sample's rows directly to the outpu
 
 Two Impact samples (`csv_row_idx` 4771, 1637 in the 5k test set) have single-point spikes in `sigma_x/y` at `z ≈ 1 μm`, right at the cathode. These are simulation artifacts on the order of 1 μm wide — finer than any practical s-grid can resolve. Filtering to `z ≥ 1 mm` skips them. The surrogate's training s-range starts at 1 mm anyway.
 
-### Why s ≤ 4.2 m
+### Why s ≤ 4.13 m
 
-Screen PR10571 (the diagnostic the previous model targets) sits at s ≈ 4.2 m. This defines the scope of the *injector* surrogate. Beyond this point the beam enters the linac/BC sections, which are out of scope for this model.
+Impact-T tracking in this dataset ends at L0AFEND (s = 4.127448 m, the exit of the L0A accelerating section). PR10571 — the diagnostic the previous covariance model targets — sits at s = 14.232788 m in the Bmad lattice and is *not* reached by this Impact run. The surrogate therefore models beam evolution over gun → L0AFEND. Beam state at PR10571 is available only via precomputed columns in `particles-571.csv` and is used solely as a filter, not a training target.
+
+Screen s-positions (from the Impact lattice in any `82.h5`-style archive):
+
+| Screen | s (m) | Notes |
+|---|---|---|
+| PR10241 | 0.942084 | Early diagnostic; quantities interpolated from Impact CSV |
+| L0AFEND | 4.127448 | End of Impact tracking; quantities interpolated |
+| PR10571 | 14.232788 | Lattice position only; not reached by Impact |
 
 ## Dataset Sizes (after alive filter `n_particles_571 ≥ 90000`)
 
