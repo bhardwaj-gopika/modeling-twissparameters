@@ -352,6 +352,70 @@ Diagnostic flags: `--skip-scatter`, `--skip-overlay`, `--skip-sorted`, `--skip-e
 - `alpha_x/y` MAPE is inflated because alpha crosses zero (range ≈ [−10, +13]); R² is the honest signal.
 - `sigma_z` R² = 0.868 looks low but MAPE = 0.96% is the lowest in the table — its dynamic range across the beamline is very narrow (~5.7e−4 to ~6.8e−4 m), so tiny absolute errors eat most of the variance. Practically fine.
 
+### 8. Inference & LUME-Torch Export (`infer_beam_evolution.py`)
+
+Runs inference on a CSV and exports LUME-Torch YAML model files for deployment. Validates both sim-parameter and machine-PV input spaces. Includes `value_range` (training-data min/max) for each input variable in the YAML.
+
+```bash
+python infer_beam_evolution.py \
+    --model-dir model-output-100h \
+    --input-csv dataset-test.csv \
+    --train-csv dataset-train.csv \
+    --output-dir inference-output
+```
+
+Outputs:
+- `inference-output/predictions.csv` — flat predictions with true targets
+- `inference-output/predictions.npy` — raw (N, 12) prediction array
+- `lumetorchyaml-sim/` — LUME-Torch model (sim-parameter + s inputs)
+- `lumetorchyaml-machine/` — LUME-Torch model (machine PV + s inputs)
+
+**Architecture of the LUME model pipeline**:
+
+- **Sim model**: `[19 sim params, s]` → `AffineInputTransform` (z-score normalization) → `BeamEvolutionModel` → `OutputDenormTransform` (z-score denorm) → 12 targets
+- **Machine model**: `[19 PVs, s]` → `PVToSimWithS` (affine PV→sim on channels 0..18, pass-through on s) → `AffineInputTransform` (z-score normalization) → `BeamEvolutionModel` → `OutputDenormTransform` → 12 targets
+
+**Custom modules** (in `lume_model_utils.py`):
+- `OutputDenormTransform(y_mean, y_std)` — applies `pred * y_std + y_mean`
+- `PVToSimWithS(pv_to_sim_transform)` — wraps `AffineInputTransform` for the 19 PV channels and passes `s` (index 19) unchanged
+
+**value_range**: Each input variable in the exported YAML includes `value_range: [min, max]` computed from the training split. For the machine model, sim-parameter ranges are first transformed via `sim_to_machine_array()` to get PV-unit ranges.
+
+**Validation**: The script asserts `np.allclose(direct_model_output, lume_model_output, rtol=1e-5, atol=1e-5)` for both input spaces (including float32 roundtrip through PV↔sim conversion for the machine model).
+
+### 9. Package Model Update
+
+Copy LUME model files into the deployable `facet2-model-twissparameters` package:
+
+```bash
+cp -r lumetorchyaml-sim/ ../facet2-model-twissparameters/facet2_inj_ml_model_twiss/resources/lumetorchyaml-sim/
+cp -r lumetorchyaml-machine/ ../facet2-model-twissparameters/facet2_inj_ml_model_twiss/resources/lumetorchyaml-machine/
+cd ../facet2-model-twissparameters && pip install -e . && cd -
+```
+
+Usage:
+```python
+from facet2_inj_ml_model_twiss import load_model
+
+model = load_model()           # machine PVs + s (default)
+model = load_model("sim")      # sim parameters + s
+
+result = model.evaluate({"QUAD:IN10:121:BCTRL": 0.022, ..., "s": 2.0})
+# Returns: sigma_x, sigma_y, ..., mean_kinetic_energy (12 scalar outputs)
+```
+
+The package lives at `../facet2-model-twissparameters/` with:
+- `facet2_inj_ml_model_twiss/` — Python package
+- `facet2_inj_ml_model_twiss/resources/` — LUME YAML + model artifacts
+- `tests/test_model_benchmark.py` — regression tests (12 tests covering loading, evaluation, PV mapping)
+
+Run tests:
+```bash
+cd ../facet2-model-twissparameters
+pip install -e ".[test]"
+pytest tests/ -v
+```
+
 ## Key Operational Details
 
 ### Alive-particle filter
@@ -399,12 +463,63 @@ Screen s-positions (from the Impact lattice in any `82.h5`-style archive):
 
 This is the working sample count.
 
+## Key Outputs & Transformations
+
+| Artifact | Description |
+|----------|-------------|
+| `model.pt` | Trained PyTorch model weights (BeamEvolutionModel) |
+| `input_transformers.pt` | Input standardization (x_mean, x_std, feature_cols) |
+| `output_transformers.pt` | Output standardization (y_mean, y_std, target_cols) |
+| `training_history.csv` | Per-epoch train_loss, val_loss, lr, phase |
+| `test_metrics.csv` | Per-target MAE and MAPE on test set |
+| LUME YAML files | lume-torch model descriptors for deployment (sim & machine input spaces) |
+
+**Transform chain (inference)**:
+1. Raw inputs → [PV→sim affine if machine inputs] → z-score normalize (subtract x_mean, divide by x_std)
+2. Model forward pass → z-score normalized predictions
+3. Destandardize: `pred * y_std + y_mean` → 12 physical-unit targets
+
+## Directory Structure
+
+```
+modeling-twissparameters/
+├── extract_twiss_from_impact.py        # Step 1: extract beam stats from .h5 archives
+├── compute_twiss_from_impact_csv.py    # Step 2: derive Twiss from Impact CSV
+├── plot_emittance_resolution_study.py  # Step 3: s-grid resolution study
+├── build_training_dataset.py           # Step 4: filter + interpolate → dataset.csv
+├── split_dataset.py                    # Step 5: train/val/test split by sample_idx
+├── train.py                            # Step 6: train the MLP
+├── analyze.py                          # Step 7: test-set evaluation + plots
+├── infer_beam_evolution.py             # Step 8: inference + LUME export
+├── lume_model_utils.py                 # Custom LUME-Torch transforms
+├── pv_mapping.py                       # Machine PV ↔ sim parameter affine mapping
+├── gpu_train.sh                        # SLURM job script
+│
+├── dataset.csv                         # Combined inputs + targets (2.45M rows)
+├── dataset-train.csv / -val.csv / -test.csv
+│
+├── model-output-100h/                  # Trained model checkpoint & transformers
+│   ├── model.pt
+│   ├── input_transformers.pt
+│   ├── output_transformers.pt
+│   └── training_history.csv
+│
+├── analysis-1/                         # Base-only model analysis
+├── analysis-2/                         # Fine-tuned model analysis (production)
+│
+├── lumetorchyaml-sim/                  # LUME-Torch model (sim inputs)
+├── lumetorchyaml-machine/              # LUME-Torch model (machine PV inputs)
+└── inference-output/                   # Inference result CSVs
+```
+
 ## Dependencies
 
-- `torch` (for training; not yet used here)
+- `torch`
 - `pandas`, `numpy`
 - `matplotlib`
 - `lume-impact` (Impact-T archive loading)
+- `lume-torch` (LUME model packaging)
+- `botorch` (`AffineInputTransform`)
 
 The `pytao` and `facet2-lattice` dependencies are no longer needed (Tao extraction was dropped).
 

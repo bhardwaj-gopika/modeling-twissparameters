@@ -225,11 +225,66 @@ On `evolution_curves.png`, true (solid) and predicted (dashed) lines are visuall
 | `split_dataset.py` | Stream-split `dataset.csv` 70/15/15 by `sample_idx` |
 | `train.py` | Train the 20→12 MLP (base + optional staged fine-tuning) |
 | `analyze.py` | Evaluate on test set; produce metrics CSV + 8 PNG figures |
+| `infer_beam_evolution.py` | Inference + LUME-Torch YAML export (sim & machine PV input spaces) |
+| `lume_model_utils.py` | Custom transforms for LUME-Torch (OutputDenormTransform, PVToSimWithS) |
+| `pv_mapping.py` | Affine mapping between machine PVs and simulator parameters |
 | `gpu_train.sh` | SLURM script for training on SDF (A100) |
 
 See [AGENTS.md](AGENTS.md) for detailed pipeline notes, Twiss derivation, conventions, and operational details.
+
+## Inference & LUME-Torch Deployment
+
+### 8. Run inference and export LUME-Torch models
+```bash
+python infer_beam_evolution.py \
+    --model-dir model-output-100h \
+    --input-csv dataset-test.csv \
+    --train-csv dataset-train.csv \
+    --output-dir inference-output
+```
+
+This script:
+1. Loads the trained model and applies it to the input CSV (auto-detects sim vs machine-PV columns).
+2. Exports LUME-Torch YAML model files with `value_range` (min/max from training data) for both input spaces.
+3. Validates both LUME models match direct model output (assertion on `np.allclose`).
+
+Outputs:
+- `inference-output/predictions.csv` — predicted values with true targets (if available)
+- `inference-output/predictions.npy` — raw prediction array
+- `lumetorchyaml-sim/` — LUME model accepting 19 sim parameters + `s`
+- `lumetorchyaml-machine/` — LUME model accepting 19 machine PVs + `s`
+
+### Using the deployed model
+
+The packaged model lives in `../facet2-model-twissparameters/`:
+
+```python
+from facet2_inj_ml_model_twiss import load_model
+
+model = load_model()           # machine PVs + s
+model = load_model("sim")      # sim parameters + s
+
+result = model.evaluate({
+    "QUAD:IN10:121:BCTRL": 0.022,
+    "KLYS:LI10:21:AMPL": 40.0,
+    # ... 17 more PVs ...
+    "s": 2.0,
+})
+# result keys: sigma_x, sigma_y, sigma_z, norm_emit_x, norm_emit_y,
+#   emit_geom_x, emit_geom_y, beta_x, alpha_x, beta_y, alpha_y, mean_kinetic_energy
+```
+
+Install the package:
+```bash
+cd ../facet2-model-twissparameters && pip install -e .
+```
+
+### PV ↔ sim mapping
+
+The machine model applies an affine PV→sim transform on the 19 control channels and passes `s` through unchanged. The mapping is defined in `pv_mapping.py` with per-channel `sim_scaling` and `sim_offset`.
 
 ## Dependencies
 
 - Python ≥ 3.10
 - `lume-impact`, `pandas`, `numpy`, `matplotlib`, `torch`
+- For inference/deployment: `lume-torch`, `botorch`
